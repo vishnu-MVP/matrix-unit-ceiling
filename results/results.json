@@ -1,0 +1,161 @@
+{
+  "_comment": "Experiment results and provenance. Figures and tables are not currently generated from this file. Each entry records the machine state it was measured under; numbers from different states must never be combined into a ratio.",
+
+  "platform": {
+    "host": "AWS r7i.4xlarge",
+    "cpu": "Xeon 8488C (Sapphire Rapids)",
+    "physical_cores": 8,
+    "logical_threads": 16,
+    "memory_gib": 123,
+    "measured_read_bw_gbs": 93.7,
+    "bw_method": "saturating OpenMP reduction, not vendor spec"
+  },
+
+  "model": {
+    "name": "27B hybrid model",
+    "arch": "qwen35 hybrid (gated delta-net + attention)",
+    "params_b": 26.9,
+    "layers_total": 64,
+    "layers_deltanet": 48,
+    "layers_attention": 16,
+    "delta_fraction": 0.75,
+    "quant": "PQ2_0 ternary, 2.13 bpw, group 128",
+    "size_gib": 6.70,
+    "size_gb": 7.19,
+    "activations": "INT8, per-256-block scale"
+  },
+
+  "ab_interleaved": {
+    "_comment": "FINAL 2026-10-05, scripts/pp_baseline.sh. Two interleaved rounds of -r 5 per cell, variant chosen via LD_LIBRARY_PATH over immutable snapshots. Supersedes ALL earlier prefill numbers, including every measurement taken with the cp-over-mapped-.so method, which segfaulted running processes and produced spurious variance. Headline uses t=16 for consistency with the profiling run (74.60) from which the Amdahl bound is derived.",
+    "method": "pp512, -r 5, two interleaved rounds, LD_LIBRARY_PATH variant selection",
+    "date": "2026-10-05",
+    "status": "complete",
+    "threads_16": {
+      "stock_rounds": [21.60, 20.73], "stock_ranges": [1.15, 0.56], "stock_mean": 21.17,
+      "ours_rounds": [72.15, 74.76], "ours_ranges": [4.61, 0.69], "ours_mean": 73.46,
+      "ratio": 3.47
+    },
+    "threads_8": {
+      "stock_rounds": [22.41, 21.05], "stock_ranges": [0.44, 0.15], "stock_mean": 21.73,
+      "ours_rounds": [73.30, 69.15], "ours_ranges": [1.90, 1.36], "ours_mean": 71.23,
+      "ratio": 3.28
+    },
+    "headline": "3.47x at t=16 (21.17 -> 73.46); 3.28x at t=8",
+    "note": "prefill variance is markedly higher at t=16 than t=8, consistent with SMT contention for per-core tile registers"
+  },
+
+  "prefill_profile": {
+    "_comment": "perf record -F 999 -g on pp512, t=16. Shares are of total prefill runtime. The run this came from measured 74.60 tok/s, so the Amdahl bound MUST be derived from 512/74.60 s and no other wall time.",
+    "source_file": "pp_now.data",
+    "threads": 16,
+    "pp512_tok_s": 74.60,
+    "date": "2026-09-30",
+    "components": [
+      {"symbol": "tinygemm_kernel_amx (ours)", "share": 56.61, "amx_eligible": "yes"},
+      {"symbol": "OpenMP barriers (libgomp)", "share": 13.27, "amx_eligible": "no"},
+      {"symbol": "gated delta-net", "share": 6.87, "amx_eligible": "no"},
+      {"symbol": "fp32 vector dot", "share": 4.23, "amx_eligible": "no"},
+      {"symbol": "fast Walsh-Hadamard transform", "share": 4.03, "amx_eligible": "no"},
+      {"symbol": "activation quantisation", "share": 2.85, "amx_eligible": "partly"},
+      {"symbol": "causal convolution", "share": 2.79, "amx_eligible": "no"},
+      {"symbol": "flash attention", "share": 1.51, "amx_eligible": "partly"},
+      {"symbol": "RMS norm", "share": 1.06, "amx_eligible": "no"},
+      {"symbol": "other (14 symbols, each <1%)", "share": 5.03, "amx_eligible": "mixed"}
+    ],
+    "libgomp_frames": ["0x24aa2 10.43", "0x24aae 1.34", "0x24aa6 1.32", "0x24aab 0.18"],
+    "sum_check": 98.25
+  },
+
+  "decode_profile": {
+    "_comment": "perf on tg128. Kernel share corresponds to ~10 tok/s in isolation, i.e. 77% of roofline; the gap is synchronisation.",
+    "source_file": "tg_now.data",
+    "threads": 16,
+    "tg128_tok_s_under_perf": 6.25,
+    "m1_vnni_kernel": 62.6,
+    "openmp_barriers": 23.2,
+    "gomp_parallel": 5.3
+  },
+
+  "ladder": {
+    "_comment": "Optimisation attribution. All six steps measured in ONE session on a loaded machine (pre-reboot). Internally comparable; NOT comparable to post-reboot absolutes. The paper must present these as a within-session series and never mix them with the clean-state numbers.",
+    "session": "pre-reboot, loaded machine",
+    "threads": 16,
+    "steps": [
+      {"name": "AVX-512 VNNI repacking GEMM (baseline)", "pp512": 17.40, "note": "baseline"},
+      {"name": "naive AMX tile port", "pp512": 13.40, "note": "regression"},
+      {"name": "+ vectorised 2-bit unpack", "pp512": 37.74, "note": ""},
+      {"name": "+ L1-resident accumulator", "pp512": 51.01, "note": ""},
+      {"name": "+ direct tile-load of activations", "pp512": 55.28, "note": ""},
+      {"name": "+ K=64 tile palette", "pp512": 59.67, "note": "+8% over previous step"}
+    ],
+    "within_session_ratio": 3.43,
+    "k64_gain_pct": 7.9
+  },
+
+  "thread_scaling": {
+    "_comment": "pp256/tg64, -r 2, single session. Note prefill variance at t=16 is large (see ab_interleaved); SMT destabilises prefill.",
+    "threads": [2, 4, 8, 16],
+    "prefill": [22.91, 44.33, 80.22, 75.52],
+    "decode": [2.06, 3.82, 6.44, 6.55],
+    "smt_begins_at": 8
+  },
+
+  "negative_results": {
+    "_comment": "Interventions that did NOT recover the decode gap. All measured t=16 in one session.",
+    "poll": {"default_50": 6.90, "poll_100": 6.92, "note": "within noise"},
+    "affinity": {"none": 75.56, "proc_bind_close": 75.51, "proc_bind_spread": 74.32, "metric": "pp512"},
+    "fewer_threads": {"16": 6.90, "8": 6.74, "6": 5.33, "4": 3.88, "metric": "tg128"}
+  },
+
+  "plain_decode": {
+    "_comment": "FINAL 2026-10-05, scripts/tg_baseline.sh. Variant selected via LD_LIBRARY_PATH over immutable snapshot dirs - NEVER by cp over a mapped .so, which corrupts running processes (error 14 segfaults) and invalidated our earlier campaign. Two interleaved rounds of -r 5 per cell. KEY RESULT: at t=16 both implementations saturate memory bandwidth and decode is invariant (ratio 0.99) despite a ~3x prefill spread. At t=8 the baseline has NOT saturated, so our kernel looks 25% better. Any decode comparison MUST state its thread count.",
+    "method": "tg128, -r 5, two interleaved rounds, LD_LIBRARY_PATH variant selection",
+    "date": "2026-10-05",
+    "threads_16": {
+      "stock_rounds": [6.42, 6.84], "stock_ranges": [0.12, 0.04], "stock_mean": 6.63,
+      "ours_rounds": [6.95, 6.21], "ours_ranges": [0.03, 0.43], "ours_mean": 6.58,
+      "ratio": 0.99
+    },
+    "threads_8": {
+      "stock_rounds": [5.33, 5.11], "stock_ranges": [0.10, 0.28], "stock_mean": 5.22,
+      "ours_rounds": [6.78, 6.24], "ours_ranges": [0.06, 0.52], "ours_mean": 6.51,
+      "ratio": 1.25
+    },
+    "smt_gain_stock_pct": 27.0,
+    "smt_gain_ours_pct": 1.1,
+    "interpretation": "decode is bandwidth-bound; at saturation a large prefill spread produces no decode spread. The baseline needs SMT to reach the ceiling (+27%); ours is already there at t=8 (+1.1%).",
+    "supports": "the invariance claim, more strongly than the original +3% figure"
+  },
+
+  "speculative": {
+    "_comment": "RE-MEASURED 2026-10-05 with scripts/mtp_bench.py against llama-server. This is the DEPLOYED configuration and belongs in the headline. Method: 3 fixed prompts x 2 trials = 6 requests per condition, n_predict=160, temperature=0, cache_prompt=false, t=16, c=8192, parallel=1. Identical prompts across conditions because acceptance is content-dependent. Kernel variant selected via LD_LIBRARY_PATH over snapshotted library sets - NEVER by cp over a mapped .so, which segfaults running processes. Decode tok/s is the server's own predicted_per_second.",
+    "method": "scripts/mtp_bench.py, 6 requests/condition, same prompts, t=16",
+    "date": "2026-10-05",
+    "rows": [
+      {"config": "our kernel, no drafting", "mean": 6.48, "min": 5.59, "max": 6.72, "median": 6.69,
+       "acceptance_pct": null, "n_accept": null, "n_draft": null},
+      {"config": "stock kernel + drafting", "mean": 8.23, "min": 7.51, "max": 8.73, "median": 8.44,
+       "acceptance_pct": 50.7, "n_accept": 574, "n_draft": 1132},
+      {"config": "our kernel + drafting", "mean": 9.92, "min": 8.69, "max": 11.17, "median": 10.56,
+       "acceptance_pct": 50.9, "n_accept": 574, "n_draft": 1128}
+    ],
+    "mtp_over_plain_decode": 1.53,
+    "kernel_gain_under_drafting": 1.20,
+    "kernel_gain_under_drafting_pct": 20.5,
+    "acceptance_control": "50.9% vs 50.7% across kernels - near-identical, so the gain is compute, not better drafting. This is the cleanest control in the paper.",
+    "deployed_tok_s": "9.92 mean, 10.56 median, 11.17 max",
+    "retracted_old_rows": "Previous table (6.69/8.18/10.27/13.85) is superseded. The 13.85 'chat' row was 5 trials and must not be reported as a point estimate."
+  },
+
+  "roofline": {
+    "bandwidth_gbs": 93.7,
+    "bytes_per_token_gb": 7.19,
+    "decode_ceiling_tok_s": 13.03,
+    "_comment": "13.03 = 93.7/7.19. Note 7.19 GB = 6.70 GiB; the paper must state GiB vs GB explicitly because 93.7/6.70 would wrongly give 13.99."
+  },
+
+  "precision_floor": {
+    "_comment": "Withdrawn; the original comparison is not reproducible and is excluded from the released results.",
+    "status": "retracted"
+  }
+}

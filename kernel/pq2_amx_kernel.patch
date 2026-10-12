@@ -1,0 +1,413 @@
+diff --git a/ggml/src/ggml-cpu/amx/amx.cpp b/ggml/src/ggml-cpu/amx/amx.cpp
+index 1118f71..e9cf89e 100644
+--- a/ggml/src/ggml-cpu/amx/amx.cpp
++++ b/ggml/src/ggml-cpu/amx/amx.cpp
+@@ -174,6 +174,9 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
+             case GGML_TYPE_IQ4_XS:
+                 alignment = 256; // QK_K
+                 break;
++            case GGML_TYPE_PQ2_0:
++                alignment = 128; // QK_PQ2_0
++                break;
+             case GGML_TYPE_F16:
+                 alignment = 16;
+                 break;
+diff --git a/ggml/src/ggml-cpu/amx/common.h b/ggml/src/ggml-cpu/amx/common.h
+index 26a6ec1..b3b885c 100644
+--- a/ggml/src/ggml-cpu/amx/common.h
++++ b/ggml/src/ggml-cpu/amx/common.h
+@@ -111,5 +111,6 @@ inline bool qtype_has_amx_kernels(const enum ggml_type type) {
+         (type == GGML_TYPE_Q4_K) ||
+         (type == GGML_TYPE_Q5_K) ||
+         (type == GGML_TYPE_Q6_K) ||
+-        (type == GGML_TYPE_IQ4_XS);
++        (type == GGML_TYPE_IQ4_XS) ||
++        (type == GGML_TYPE_PQ2_0);
+ }
+diff --git a/ggml/src/ggml-cpu/amx/mmq.cpp b/ggml/src/ggml-cpu/amx/mmq.cpp
+index 9f3a744..aba69f2 100644
+--- a/ggml/src/ggml-cpu/amx/mmq.cpp
++++ b/ggml/src/ggml-cpu/amx/mmq.cpp
+@@ -57,6 +57,9 @@ struct Unroll<1> {
+ // type traits
+ template <typename T> struct PackedTypes {};
+ template <> struct PackedTypes<block_q4_0> { using type = int8_t; };
++template <> struct PackedTypes<block_pq2_0> { using type = int8_t; };
++// defined further down, but called before that point
++void pack_B(void * RESTRICT packed_B, const block_pq2_0 * RESTRICT B, int KB);
+ template <> struct PackedTypes<block_q4_1> { using type = uint8_t; };
+ template <> struct PackedTypes<block_q8_0> { using type = int8_t; };
+ template <typename T> using packed_B_type = typename PackedTypes<T>::type;
+@@ -75,7 +78,8 @@ struct is_type_qkk : std::integral_constant<bool,
+     std::is_same<T, block_q4_K>::value ||
+     std::is_same<T, block_q5_K>::value ||
+     std::is_same<T, block_q6_K>::value ||
+-    std::is_same<T, block_iq4_xs>::value> {};
++    std::is_same<T, block_iq4_xs>::value ||
++    std::is_same<T, block_pq2_0>::value> {};
+ 
+ #define GGML_DISPATCH_FLOATING_TYPES(TYPE, ...)                                        \
+     [&] {                                                                              \
+@@ -110,6 +114,12 @@ struct is_type_qkk : std::integral_constant<bool,
+                 constexpr int blck_size = QK4_1;                                       \
+                 return __VA_ARGS__();                                                  \
+             }                                                                          \
++            case GGML_TYPE_PQ2_0: {                                           \
++                using type = block_pq2_0;                                     \
++                using vec_dot_type = block_q8_K;                              \
++                constexpr int blck_size = QK_PQ2_0;                           \
++                return __VA_ARGS__();                                         \
++            }                                                                 \
+             case GGML_TYPE_Q8_0: {                                                     \
+                 using type = block_q8_0;                                               \
+                 using vec_dot_type = block_q8_0;                                       \
+@@ -201,10 +211,31 @@ struct tile_config_t{
+ //    advanced-matrix-extensions-intrinsics-functions.html
+ //
+ 
+-inline void ggml_tile_config_init(void) {
+-    static thread_local bool done = false;
++// Which palette this thread currently has loaded. A model can mix PQ2_0 (K=64 tiles)
++// with other AMX types (K=32), so the two configs must be able to replace each other
++// rather than each latching a one-shot "done" flag.
++enum amx_tile_cfg { AMX_TILE_CFG_NONE = 0, AMX_TILE_CFG_STD, AMX_TILE_CFG_K64 };
++static thread_local amx_tile_cfg amx_tile_cfg_current = AMX_TILE_CFG_NONE;
+ 
+-    if (done) {
++inline void ggml_tile_config_init_k64(void) {
++    if (amx_tile_cfg_current == AMX_TILE_CFG_K64) {
++        return;
++    }
++
++    alignas(64) tile_config_t tc = {};
++    tc.palette_id = 1;
++    tc.start_row = 0;
++    for (int i = 0; i < 8; ++i) {
++        tc.rows[i] = 16;
++        tc.colsb[i] = 64;
++    }
++
++    _tile_loadconfig(&tc);
++    amx_tile_cfg_current = AMX_TILE_CFG_K64;
++}
++
++inline void ggml_tile_config_init(void) {
++    if (amx_tile_cfg_current == AMX_TILE_CFG_STD) {
+         return;
+     }
+ 
+@@ -221,7 +252,7 @@ inline void ggml_tile_config_init(void) {
+     tc.rows[7] = 16;  tc.colsb[7] = 64;
+ 
+     _tile_loadconfig(&tc);
+-    done = true;
++    amx_tile_cfg_current = AMX_TILE_CFG_STD;
+ }
+ 
+ // we need an extra 16 * 4B (TILE_N * int32_t) for each NB/KB block for compensation.
+@@ -986,6 +1017,27 @@ void unpack_B<block_q5_K>(int8_t * RESTRICT tile, const void * RESTRICT packed_B
+     }
+ }
+ 
++template <>
++void unpack_B<block_pq2_0>(int8_t * RESTRICT tile, const void * RESTRICT packed_B, int k) {
++    const uint8_t * qs = (const uint8_t *)packed_B;   // byte-transposed, 16 rows contiguous
++    // _tile_dpbssd wants the B operand in VNNI order: element (kl, r) at [kl/4][r*4 + kl%4].
++    // One packed byte holds kl = 4j..4j+3, so row r's 4 codes land in the single dword at
++    // tile + j*TILE_N*4 + r*4 -- so 16 rows expand to 16 contiguous dwords per j.
++    // k indexes a PQ2_TK(64)-element group, i.e. 16 packed bytes.
++    const __m512i one = _mm512_set1_epi8(1);
++    for (int j = 0; j < 16; ++j) {
++        __m512i v = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(qs + (k * 16 + j) * TILE_N)));
++        __m512i c = _mm512_or_si512(
++            _mm512_or_si512(
++                _mm512_and_si512(v, _mm512_set1_epi32(0x03)),
++                _mm512_slli_epi32(_mm512_and_si512(v, _mm512_set1_epi32(0x0C)), 6)),
++            _mm512_or_si512(
++                _mm512_slli_epi32(_mm512_and_si512(v, _mm512_set1_epi32(0x30)), 12),
++                _mm512_slli_epi32(_mm512_and_si512(v, _mm512_set1_epi32(0xC0)), 18)));
++        _mm512_storeu_si512((__m512i *)(tile + j * TILE_N * VNNI_BLK), _mm512_sub_epi8(c, one));
++    }
++}
++
+ template <>
+ void unpack_B<block_q6_K>(int8_t * RESTRICT tile, const void * RESTRICT packed_B, int k) {
+     // lower 4bits, stride 128 bytes
+@@ -1201,6 +1253,29 @@ struct acc_C<block_q8_K, block_q5_K, is_acc> {
+     }
+ };
+ 
++template <bool is_acc>
++struct acc_C<block_q8_K, block_pq2_0, is_acc> {
++    static void apply(float * RESTRICT C, int ldc, const int32_t * RESTRICT tile, const block_q8_K * A, int lda, const void * packed_B, int nr) {
++        const ggml_half * d0 = reinterpret_cast<const ggml_half *>((const char *)packed_B + (QK_PQ2_0 / 4) * TILE_N);
++        const __m512 vd0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)d0));
++
++        for (int m = 0; m < nr; ++m) {
++            const float d1 = A[m * lda].d;
++            const __m512 vd = _mm512_mul_ps(_mm512_set1_ps(d1), vd0);
++            const __m512 vtile = _mm512_cvtepi32_ps(_mm512_loadu_si512(tile + m * TILE_N));
++
++            __m512 vsum;
++            if (is_acc) {
++                vsum = _mm512_loadu_ps(C + m * ldc);
++            } else {
++                vsum = _mm512_set1_ps(0.f);
++            }
++            vsum = _mm512_fmadd_ps(vtile, vd, vsum);
++            _mm512_storeu_ps(C + m * ldc, vsum);
++        }
++    }
++};
++
+ template <bool is_acc>
+ struct acc_C<block_q8_K, block_q6_K, is_acc> {
+     static void apply(float * RESTRICT C, int ldc, const int32_t * RESTRICT tile, const block_q8_K * A, int lda, const void * packed_B, int nr) {
+@@ -1257,6 +1332,7 @@ template <typename TB> constexpr int get_quants_size();
+ template <> constexpr int get_quants_size<block_q4_K>() { return (QK_K / 2) * TILE_N; }
+ template <> constexpr int get_quants_size<block_q5_K>() { return (QK_K / 2) * TILE_N + (QK_K / 8) * TILE_N; }
+ template <> constexpr int get_quants_size<block_q6_K>() { return (QK_K / 2) * TILE_N + (QK_K / 4) * TILE_N; }
++template <> constexpr int get_quants_size<block_pq2_0>() { return (QK_PQ2_0 / 4) * TILE_N; }
+ template <> constexpr int get_quants_size<block_iq4_xs>() { return (QK_K / 2) * TILE_N; }
+ 
+ // used for QKK format
+@@ -1361,6 +1437,98 @@ void convert_B_packed_format(void * RESTRICT packed_B, const TB * RESTRICT B, in
+ 
+ template <typename TA, typename TB, typename TC, int BLOCK_M, int BLOCK_N, int BLOCK_K>
+ struct tinygemm_kernel_vnni {};
++// ---- PQ2_0 (Bonsai ternary, group 128) AMX/VNNI support ----------------------
++// packed_B layout per 16-row tile:
++//   qs {QK_PQ2_0/4 = 32, TILE_N} uint8   (byte-transposed: 16 rows contiguous)
++//   d  {TILE_N}                  ggml_half
++template <>
++inline void pack_qs<block_pq2_0>(void * RESTRICT packed_B, const block_pq2_0 * RESTRICT B, int KB) {
++    uint8_t * out = (uint8_t *)packed_B;
++    for (int byte_i = 0; byte_i < QK_PQ2_0 / 4; ++byte_i) {
++        for (int row = 0; row < TILE_N; ++row) {
++            out[byte_i * TILE_N + row] = B[row * KB].qs[byte_i];
++        }
++    }
++}
++
++void pack_B(void * RESTRICT packed_B, const block_pq2_0 * RESTRICT B, int KB) {
++    pack_qs(packed_B, B, KB);
++    ggml_half * d = reinterpret_cast<ggml_half *>((char *)packed_B + (QK_PQ2_0 / 4) * TILE_N);
++    for (int n = 0; n < TILE_N; ++n) {
++        d[n] = B[n * KB].d;
++    }
++}
++
++template <int BLOCK_M, int BLOCK_N, int BLOCK_K>
++struct tinygemm_kernel_vnni<block_q8_K, block_pq2_0, float, BLOCK_M, BLOCK_N, BLOCK_K> {
++    static void apply(int KB, const void * RESTRICT _A, const void * RESTRICT _B, float * RESTRICT C, int ldc) {
++        constexpr int COLS = BLOCK_N / 16;
++        const int TILE_SIZE = (QK_PQ2_0 / 4) * TILE_N + TILE_N * sizeof(ggml_half);
++
++        const block_q8_K  * RESTRICT A = static_cast<const block_q8_K *>(_A);
++        const char        * RESTRICT B = static_cast<const char *>(_B);
++
++        __m512 vc[COLS];
++        auto loadc = [&](auto col) { vc[col] = _mm512_setzero_ps(); };
++        Unroll<COLS>{}(loadc);
++
++        auto compute = [&](auto col, auto i) {
++            // two PQ2_0 blocks share one Q8_K block; i&1 picks the half
++            const block_q8_K * RESTRICT ab = &A[i >> 1];
++            const int8_t     * RESTRICT q8 = ab->qs + 128 * (i & 1);
++
++            const char      * b_ptr = B + PACKED_INDEX(col, i, KB, TILE_SIZE);
++            const uint8_t   * b_qs  = (const uint8_t *)b_ptr;
++            const ggml_half * b_d   = (const ggml_half *)(b_ptr + (QK_PQ2_0 / 4) * TILE_N);
++
++            __m512i acc = _mm512_setzero_si512();
++
++            int32_t act_sum = 0;
++            for (int byte_i = 0; byte_i < QK_PQ2_0 / 4; ++byte_i) {
++                // pack_qs made the 16 rows' byte contiguous -> plain zero-extend load
++                __m128i vqs8 = _mm_loadu_si128((const __m128i *)(b_qs + byte_i * TILE_N));
++                __m512i v    = _mm512_cvtepu8_epi32(vqs8);
++
++                // spread the 4 packed 2-bit codes into the 4 bytes of each dword lane
++                __m512i vb = _mm512_or_si512(
++                    _mm512_or_si512(
++                        _mm512_and_si512(v, _mm512_set1_epi32(0x03)),
++                        _mm512_slli_epi32(_mm512_and_si512(v, _mm512_set1_epi32(0x0C)), 6)),
++                    _mm512_or_si512(
++                        _mm512_slli_epi32(_mm512_and_si512(v, _mm512_set1_epi32(0x30)), 12),
++                        _mm512_slli_epi32(_mm512_and_si512(v, _mm512_set1_epi32(0xC0)), 18)));
++
++                int32_t act_word;
++                memcpy(&act_word, q8 + byte_i * 4, 4);   // element base is exactly 4*byte_i
++                acc = _mm512_dpbusd_epi32(acc, vb, _mm512_set1_epi32(act_word));
++
++                // accumulate sum(q8) for the +1 code bias. NOTE: we must NOT use
++                // Q8_K's bsums here - quantize_row_q8_K_vnni computes them after
++                // transpose_16x4_32bit, so each lane sums a strided set of elements
++                // spread over all four 64B vectors rather than a contiguous group of 16.
++                act_sum += (int32_t)(int8_t)(act_word)       + (int32_t)(int8_t)(act_word >> 8)
++                         + (int32_t)(int8_t)(act_word >> 16) + (int32_t)(int8_t)(act_word >> 24);
++            }
++
++            acc = _mm512_sub_epi32(acc, _mm512_set1_epi32(act_sum));
++
++            const __m512 vd0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)b_d));
++            const __m512 vd1 = _mm512_set1_ps(ab->d);
++            vc[col] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc), _mm512_mul_ps(vd0, vd1), vc[col]);
++        };
++
++        for (int i = 0; i < KB; ++i) {
++            Unroll<COLS>{}(compute, i);
++        }
++
++        auto storec = [&](int col) {
++            _mm512_storeu_ps((__m512i*)(C + 0 * ldc + col * 16), vc[col]);
++        };
++        Unroll<COLS>{}(storec);
++    }
++};
++
++
+ 
+ template <int BLOCK_M, int BLOCK_N, int BLOCK_K>
+ struct tinygemm_kernel_vnni<block_q8_0, block_q4_0, float, BLOCK_M, BLOCK_N, BLOCK_K> {
+@@ -2174,7 +2342,113 @@ void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const v
+ }
+ 
+ template <typename TA, typename TB, typename TC, int BLOCK_K,
+-          typename std::enable_if<is_type_qkk<TB>::value, int>::type = 0>
++          typename std::enable_if<std::is_same<TB, block_pq2_0>::value, int>::type = 0>
++void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const void * RESTRICT _B, float * RESTRICT C, int ldc) {
++    static_assert(std::is_same<TA, block_q8_K>::value);
++    const int TILE_SIZE = get_tile_size<block_pq2_0>();
++    GGML_ASSERT(N == 2 * TILE_N);
++
++    const block_q8_K * RESTRICT Ab = static_cast<const block_q8_K *>(_A);
++    const char * RESTRICT B = static_cast<const char *>(_B);
++    const size_t lda_bytes = (size_t)KB * sizeof(block_q8_K);
++
++    constexpr int PQ2_TK = 4 * VNNI_BLK * VNNI_BLK;   // 64: AMX's max K for int8 tiles
++    constexpr int NK = QK_PQ2_0 / PQ2_TK;
++    constexpr int LDA = 2 * TILE_N;
++
++    alignas(64) int8_t  SB[NK][2][PQ2_TK * TILE_N];
++    alignas(64) int8_t  TileA[TILE_M * PQ2_TK];
++    alignas(64) int32_t Sumi4[TILE_M * TILE_N];
++    alignas(64) int32_t Sumi5[TILE_M * TILE_N];
++    alignas(64) int32_t Sumi6[TILE_M * TILE_N];
++    alignas(64) int32_t Sumi7[TILE_M * TILE_N];
++    // Compact L1-resident accumulator: acc_C runs once per 128-weight block, and going
++    // straight to dst each time means KB scattered read-modify-writes strided by ldc.
++    // Hoisting the B unpack out of this loop instead was measured twice and lost both
++    // times - it costs more in A locality than it saves in unpack.
++    alignas(64) float   Cacc[2 * TILE_M * LDA];
++
++    for (int mb = 0; mb < M; mb += 2 * TILE_M) {
++        const int mr = M - mb;
++        const int m0 = std::min(mr, TILE_M);
++        const int m1 = mr > TILE_M ? std::min(mr - TILE_M, TILE_M) : 0;
++        float * RESTRICT Cm = C + (size_t)mb * ldc;
++
++        for (int i = 0; i < KB; ++i) {
++            const int half = (i & 1) * (QK_K / 2);
++            const char * RESTRICT b0 = B + PACKED_INDEX(0, i, KB, TILE_SIZE);
++            const char * RESTRICT b1 = B + PACKED_INDEX(1, i, KB, TILE_SIZE);
++            const block_q8_K * RESTRICT Ai = Ab + (size_t)mb * KB + (i >> 1);
++
++            for (int k = 0; k < NK; ++k) {
++                unpack_B<block_pq2_0>(SB[k][0], b0, k);
++                unpack_B<block_pq2_0>(SB[k][1], b1, k);
++            }
++
++            _tile_zero(TMM4);
++            _tile_zero(TMM6);
++            if (m1 != 0) { _tile_zero(TMM5); _tile_zero(TMM7); }
++
++            for (int k = 0; k < NK; ++k) {
++                _tile_loadd(TMM0, SB[k][0], TILE_N * VNNI_BLK);
++                _tile_loadd(TMM1, SB[k][1], TILE_N * VNNI_BLK);
++
++                // activation rows are uniformly strided, so AMX can load the tile
++                // straight out of the Q8_K buffer - no gather needed for full tiles
++                const char * RESTRICT a0 = (const char *)Ai + offsetof(block_q8_K, qs) + half + k * PQ2_TK;
++                if (m0 == TILE_M) {
++                    _tile_loadd(TMM2, a0, lda_bytes);
++                } else {
++                    for (int mm = 0; mm < m0; ++mm) {
++                        memcpy(TileA + mm * PQ2_TK, Ai[mm * KB].qs + half + k * PQ2_TK, PQ2_TK);
++                    }
++                    memset(TileA + m0 * PQ2_TK, 0, (TILE_M - m0) * PQ2_TK);
++                    _tile_loadd(TMM2, TileA, PQ2_TK);
++                }
++                _tile_dpbssd(TMM4, TMM2, TMM0);
++                _tile_dpbssd(TMM6, TMM2, TMM1);
++
++                if (m1 != 0) {
++                    const block_q8_K * RESTRICT Ai2 = Ai + TILE_M * KB;
++                    if (m1 == TILE_M) {
++                        _tile_loadd(TMM3, (const char *)Ai2 + offsetof(block_q8_K, qs) + half + k * PQ2_TK, lda_bytes);
++                    } else {
++                        for (int mm = 0; mm < m1; ++mm) {
++                            memcpy(TileA + mm * PQ2_TK, Ai2[mm * KB].qs + half + k * PQ2_TK, PQ2_TK);
++                        }
++                        memset(TileA + m1 * PQ2_TK, 0, (TILE_M - m1) * PQ2_TK);
++                        _tile_loadd(TMM3, TileA, PQ2_TK);
++                    }
++                    _tile_dpbssd(TMM5, TMM3, TMM0);
++                    _tile_dpbssd(TMM7, TMM3, TMM1);
++                }
++            }
++
++            _tile_stored(TMM4, Sumi4, TILE_N * sizeof(int32_t));
++            _tile_stored(TMM6, Sumi6, TILE_N * sizeof(int32_t));
++            if (m1 != 0) {
++                _tile_stored(TMM5, Sumi5, TILE_N * sizeof(int32_t));
++                _tile_stored(TMM7, Sumi7, TILE_N * sizeof(int32_t));
++            }
++
++            GGML_DISPATCH_BOOL(i > 0, is_acc, [&] {
++                acc_C<block_q8_K, block_pq2_0, is_acc>::apply(Cacc, LDA, Sumi4, Ai, KB, b0, m0);
++                acc_C<block_q8_K, block_pq2_0, is_acc>::apply(Cacc + TILE_N, LDA, Sumi6, Ai, KB, b1, m0);
++                if (m1 != 0) {
++                    acc_C<block_q8_K, block_pq2_0, is_acc>::apply(Cacc + TILE_M * LDA, LDA, Sumi5, Ai + TILE_M * KB, KB, b0, m1);
++                    acc_C<block_q8_K, block_pq2_0, is_acc>::apply(Cacc + TILE_M * LDA + TILE_N, LDA, Sumi7, Ai + TILE_M * KB, KB, b1, m1);
++                }
++            });
++        }
++
++        for (int mm = 0; mm < m0 + m1; ++mm) {
++            memcpy(Cm + (size_t)mm * ldc, Cacc + mm * LDA, LDA * sizeof(float));
++        }
++    }
++}
++
++template <typename TA, typename TB, typename TC, int BLOCK_K,
++          typename std::enable_if<is_type_qkk<TB>::value && !std::is_same<TB, block_pq2_0>::value, int>::type = 0>
+ void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const void * RESTRICT _B, float * RESTRICT C, int ldc) {
+     static_assert(std::is_same<TA, block_q8_K>::value);
+     const int TILE_SIZE = get_tile_size<TB>();
+@@ -2415,7 +2689,7 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
+ 
+             // Q4_0, Q4_1, Q8_0 handles 1 TILE_K per blck_size
+             // Q4_K, Q5_K, Q6_K, IQ4_XS handles 8 TILE_K per blck_size
+-            GGML_ASSERT(TILE_K == blck_size || TILE_K * 8 == blck_size);
++            GGML_ASSERT(TILE_K == blck_size || TILE_K * 4 == blck_size || TILE_K * 8 == blck_size);
+ 
+             parallel_for_ggml(params, n_batch * M, [&](int begin, int end) {
+                 for (int idx = begin; idx < end; ++idx) {
+@@ -2469,14 +2743,14 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
+     }
+ 
+     // handle 4 tiles at a tile
+-    constexpr int BLOCK_M = TILE_M * 2;
++    const int BLOCK_M = (TYPE == GGML_TYPE_PQ2_0) ? M : TILE_M * 2;
+     constexpr int BLOCK_N = TILE_N * 2;
+     const int MB = div_up(M, BLOCK_M);
+     const int NB = div_up(N, BLOCK_N);
+ 
+     parallel_for_ggml(params, n_batch * MB * NB, [&](int begin, int end) {
+         // init tile config for each thread
+-        ggml_tile_config_init();
++        if (TYPE == GGML_TYPE_PQ2_0) { ggml_tile_config_init_k64(); } else { ggml_tile_config_init(); }
+ 
+         GGML_DISPATCH_QTYPES(TYPE, [&] {
+             const int KB = K / blck_size;
